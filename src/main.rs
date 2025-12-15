@@ -3,9 +3,8 @@
 //! Interactive visualization of the procedural map generation.
 
 use macroquad::prelude::*;
-use mapgen::{MapConfig, generate_map};
+use mapgen::{GenerationConfig, generate_map_with_config, generate_map_stats, print_map_report};
 use mapgen::geometry::BoundingBox;
-use mapgen::island::IslandShape;
 use mapgen::visualizer::Visualizer;
 use mapgen::mesh::DualMesh;
 
@@ -22,23 +21,27 @@ fn window_conf() -> Conf {
 struct AppState {
     mesh: DualMesh,
     visualizer: Visualizer,
-    config: MapConfig,
+    config: GenerationConfig,
     generation_count: u64,
 }
 
 impl AppState {
     fn new() -> Self {
-        let config = MapConfig {
-            bounds: BoundingBox::new(0.0, 0.0, 1000.0, 1000.0),
-            num_points: 1000,
+        // Use high quality config with optimized terrain parameters
+        let config = GenerationConfig {
+            bounds: BoundingBox::new(0.0, 0.0, 3000.0, 3000.0),
+            num_points: 8000,
             seed: 12345,
-            lloyd_iterations: 2,
-            island_shape: IslandShape::Radial,
-            island_factor: 0.7,
-            num_rivers: 30,
+            num_rivers: 120,
+            ..Default::default()  // Uses optimized terrain params from config.rs
         };
 
-        let mesh = generate_map(&config);
+        let mesh = generate_map_with_config(&config);
+        
+        // Print initial report
+        let stats = generate_map_stats(&mesh);
+        print_map_report(&stats);
+        
         let visualizer = Visualizer::new(config.bounds);
 
         Self {
@@ -54,24 +57,15 @@ impl AppState {
         
         // Change seed for variety
         self.config.seed = 12345 + self.generation_count * 1000;
-        
-        // Cycle through island shapes
-        self.config.island_shape = match self.generation_count % 4 {
-            0 => IslandShape::Radial,
-            1 => IslandShape::Blob,
-            2 => IslandShape::Square,
-            _ => IslandShape::Noise,
-        };
 
-        println!("Regenerating map #{} with {:?} shape...", 
-                 self.generation_count, self.config.island_shape);
+        println!("\nRegenerating map #{} (seed: {})...", 
+                 self.generation_count, self.config.seed);
         
-        self.mesh = generate_map(&self.config);
+        self.mesh = generate_map_with_config(&self.config);
         
-        println!("Generated {} regions, {} corners, {} edges",
-                 self.mesh.num_solid_centers,
-                 self.mesh.num_solid_corners,
-                 self.mesh.num_solid_edges);
+        // Print generation report
+        let stats = generate_map_stats(&self.mesh);
+        print_map_report(&stats);
     }
 
     fn update(&mut self) {

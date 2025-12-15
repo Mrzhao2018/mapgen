@@ -90,8 +90,13 @@ fn trace_river(mesh: &mut DualMesh, source: usize) {
         // Increment river volume at this corner
         mesh.corners[current].river += 1;
 
-        // If we reached ocean/water, stop
+        // If we reached ocean, coast, or lake, stop
         if mesh.corners[current].ocean || mesh.corners[current].coast {
+            break;
+        }
+        
+        // If we reached a lake (freshwater), stop here - rivers flow INTO lakes
+        if mesh.corners[current].water && !mesh.corners[current].ocean {
             break;
         }
 

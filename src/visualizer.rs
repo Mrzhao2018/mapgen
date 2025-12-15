@@ -99,9 +99,59 @@ impl Visualizer {
         )
     }
 
+    /// Clamp camera position to keep map visible.
+    fn clamp_camera(&mut self) {
+        let screen_w = screen_width();
+        let screen_h = screen_height();
+        let map_w = self.bounds.width() as f32 * self.zoom;
+        let map_h = self.bounds.height() as f32 * self.zoom;
+        let map_min_x = self.bounds.min.x as f32 * self.zoom;
+        let map_min_y = self.bounds.min.y as f32 * self.zoom;
+        
+        // Calculate the visible map area in screen coordinates
+        let map_left = self.camera_offset.x + map_min_x;
+        let map_right = map_left + map_w;
+        let map_top = self.camera_offset.y + map_min_y;
+        let map_bottom = map_top + map_h;
+        
+        // Ensure map fills screen (or is centered if smaller than screen)
+        if map_w >= screen_w {
+            // Map is wider than screen - constrain panning
+            if map_left > 0.0 {
+                self.camera_offset.x -= map_left;
+            }
+            if map_right < screen_w {
+                self.camera_offset.x += screen_w - map_right;
+            }
+        } else {
+            // Map is smaller than screen - center it
+            self.camera_offset.x = (screen_w - map_w) / 2.0 - map_min_x;
+        }
+        
+        if map_h >= screen_h {
+            // Map is taller than screen - constrain panning
+            if map_top > 0.0 {
+                self.camera_offset.y -= map_top;
+            }
+            if map_bottom < screen_h {
+                self.camera_offset.y += screen_h - map_bottom;
+            }
+        } else {
+            // Map is smaller than screen - center it
+            self.camera_offset.y = (screen_h - map_h) / 2.0 - map_min_y;
+        }
+    }
+
     /// Handle input for camera control.
     pub fn handle_input(&mut self) -> bool {
         let mut regenerate = false;
+
+        // Calculate min zoom to fit map in screen
+        let screen_w = screen_width();
+        let screen_h = screen_height();
+        let map_w = self.bounds.width() as f32;
+        let map_h = self.bounds.height() as f32;
+        let min_zoom = (screen_w / map_w).min(screen_h / map_h) * 0.95;
 
         // Zoom with mouse wheel
         let (_, wheel_y) = mouse_wheel();
@@ -111,7 +161,8 @@ impl Visualizer {
             
             // Reduced sensitivity: 0.05 instead of 0.1
             self.zoom *= 1.0 + wheel_y * 0.05;
-            self.zoom = self.zoom.clamp(0.1, 10.0);
+            // Limit zoom: min_zoom to 5.0 (can't zoom out past map bounds)
+            self.zoom = self.zoom.clamp(min_zoom, 5.0);
             
             // Adjust offset to zoom toward mouse position
             let new_screen_pos = self.map_to_screen(old_map_pos);
@@ -132,6 +183,9 @@ impl Visualizer {
         if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
             self.camera_offset.x -= pan_speed;
         }
+        
+        // Clamp camera after any movement
+        self.clamp_camera();
 
         // Toggle displays
         if is_key_pressed(KeyCode::V) {
@@ -196,12 +250,23 @@ impl Visualizer {
     /// Draw the complete map.
     pub fn draw(&self, mesh: &DualMesh) {
         // Clear background
-        clear_background(Color::from_rgba(20, 30, 40, 255));
+        let bg_color = Color::from_rgba(20, 30, 40, 255);
+        clear_background(bg_color);
 
-        // Draw polygons
-        for i in 0..mesh.num_solid_centers {
-            self.draw_polygon(mesh, i);
+        // Draw polygons in batches to avoid vertex buffer overflow
+        // macroquad has a limit of ~65535 vertices per batch
+        const BATCH_SIZE: usize = 1000;
+        for batch_start in (0..mesh.num_solid_centers).step_by(BATCH_SIZE) {
+            let batch_end = (batch_start + BATCH_SIZE).min(mesh.num_solid_centers);
+            for i in batch_start..batch_end {
+                self.draw_polygon(mesh, i);
+            }
+            // Flush the batch to prevent vertex buffer overflow
+            gl_use_default_material();
         }
+
+        // Mask areas outside map boundary with background color
+        self.draw_boundary_mask(bg_color);
 
         // Draw Voronoi edges
         if self.show_voronoi {
@@ -231,12 +296,49 @@ impl Visualizer {
         // Draw UI
         self.draw_ui(mesh);
     }
+    
+    /// Draw rectangles to mask areas outside the map boundary.
+    fn draw_boundary_mask(&self, color: Color) {
+        let screen_w = screen_width();
+        let screen_h = screen_height();
+        
+        // Convert map bounds to screen coordinates
+        let map_top_left = self.map_to_screen(self.bounds.min);
+        let map_bottom_right = self.map_to_screen(self.bounds.max);
+        
+        // Draw four rectangles to cover areas outside the map
+        // Top
+        if map_top_left.y > 0.0 {
+            draw_rectangle(0.0, 0.0, screen_w, map_top_left.y, color);
+        }
+        // Bottom
+        if map_bottom_right.y < screen_h {
+            draw_rectangle(0.0, map_bottom_right.y, screen_w, screen_h - map_bottom_right.y, color);
+        }
+        // Left
+        if map_top_left.x > 0.0 {
+            draw_rectangle(0.0, map_top_left.y, map_top_left.x, map_bottom_right.y - map_top_left.y, color);
+        }
+        // Right
+        if map_bottom_right.x < screen_w {
+            draw_rectangle(map_bottom_right.x, map_top_left.y, screen_w - map_bottom_right.x, map_bottom_right.y - map_top_left.y, color);
+        }
+    }
 
     /// Draw a single Voronoi polygon.
     fn draw_polygon(&self, mesh: &DualMesh, center_idx: usize) {
         let center = &mesh.centers[center_idx];
-        // Use clipped vertices to avoid drawing outside bounds
-        let vertices = mesh.get_polygon_vertices_clipped(center_idx, Some(&self.bounds));
+        
+        // Skip if center is outside visible area (frustum culling)
+        let screen_center = self.map_to_screen(center.position);
+        let margin = 200.0; // Extra margin for polygon edges
+        if screen_center.x < -margin || screen_center.x > screen_width() + margin ||
+           screen_center.y < -margin || screen_center.y > screen_height() + margin {
+            return;
+        }
+        
+        // Get vertices without clipping - we'll mask the boundary later
+        let vertices = mesh.get_polygon_vertices(center_idx);
 
         if vertices.len() < 3 {
             return;

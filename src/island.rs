@@ -2,9 +2,13 @@
 //!
 //! This module determines which regions are land vs water,
 //! and distinguishes ocean (connected to boundary) from lakes.
+//!
+//! Features:
+//! - Domain Warping: Uses Fbm noise with coordinate distortion for natural coastlines
+//! - Multiple shape types: Radial, Square, Blob, Noise, and DomainWarp
 
 use std::collections::VecDeque;
-use noise::{NoiseFn, Perlin};
+use noise::{NoiseFn, Perlin, Fbm, MultiFractal};
 use crate::geometry::{Point, BoundingBox};
 use crate::mesh::{DualMesh, NONE};
 
@@ -46,6 +50,8 @@ pub enum IslandShape {
     Noise,
     /// Blob shape (smooth organic).
     Blob,
+    /// Domain warped shape (natural, fractal coastlines like Norway).
+    DomainWarp,
 }
 
 /// Shape function that determines if a point should be land.
@@ -245,6 +251,110 @@ impl ShapeFunction for BlobIsland {
     }
 }
 
+/// Domain Warped island shape using Fbm noise with coordinate distortion.
+/// This creates natural, fractal coastlines similar to Norway's fjords.
+pub struct DomainWarpIsland {
+    /// Primary continent shape noise
+    continent_noise: Fbm<Perlin>,
+    /// Secondary detail noise for coastlines
+    detail_noise: Fbm<Perlin>,
+    /// Warp noise for coordinate distortion
+    warp_noise: Fbm<Perlin>,
+    /// Configuration
+    config: IslandConfig,
+}
+
+impl DomainWarpIsland {
+    pub fn new(config: &IslandConfig) -> Self {
+        // Large-scale continent shape: low frequency, high influence
+        let mut continent_noise = Fbm::<Perlin>::new(config.seed);
+        continent_noise = continent_noise
+            .set_octaves(4)
+            .set_frequency(0.8)  // Very low frequency for large landmasses
+            .set_lacunarity(2.0)
+            .set_persistence(0.5);
+
+        // Detail noise for coastline irregularity
+        let mut detail_noise = Fbm::<Perlin>::new(config.seed.wrapping_add(1000));
+        detail_noise = detail_noise
+            .set_octaves(6)
+            .set_frequency(2.5)  // Higher frequency for coastline details
+            .set_lacunarity(2.2)
+            .set_persistence(0.45);
+
+        // Warp noise for coordinate distortion
+        let mut warp_noise = Fbm::<Perlin>::new(config.seed.wrapping_add(2000));
+        warp_noise = warp_noise
+            .set_octaves(4)
+            .set_frequency(1.2)
+            .set_lacunarity(2.0)
+            .set_persistence(0.5);
+
+        Self {
+            continent_noise,
+            detail_noise,
+            warp_noise,
+            config: config.clone(),
+        }
+    }
+}
+
+impl ShapeFunction for DomainWarpIsland {
+    fn evaluate(&self, point: &Point, bounds: &BoundingBox) -> f64 {
+        let center = bounds.center();
+        let size = bounds.width().min(bounds.height());
+
+        // Normalize to [-1, 1] range
+        let nx = (point.x - center.x) / (size * 0.5);
+        let ny = (point.y - center.y) / (size * 0.5);
+
+        // ===== DOMAIN WARPING =====
+        // Warp coordinates to break any regularity
+        let warp_strength = 0.4;
+        let wx = self.warp_noise.get([nx * 1.5 + 0.31, ny * 1.5 + 0.73]) * warp_strength;
+        let wy = self.warp_noise.get([nx * 1.5 + 0.97, ny * 1.5 + 0.17]) * warp_strength;
+        let warped_x = nx + wx;
+        let warped_y = ny + wy;
+
+        // ===== NOISE-DRIVEN CONTINENT SHAPE =====
+        // This is the key: noise DIRECTLY determines land, not radial distance
+        
+        // Large-scale continent noise (determines if area is land or sea)
+        let continent = self.continent_noise.get([warped_x + 0.5, warped_y + 0.5]);
+        
+        // Detail noise for coastline irregularity
+        let detail = self.detail_noise.get([warped_x * 2.0 + 0.3, warped_y * 2.0 + 0.7]) * 0.3;
+        
+        // Combined noise value
+        let noise_value = continent + detail;
+
+        // ===== SOFT EDGE BOUNDARY =====
+        // Only use distance for a SOFT falloff at map edges (not for shape!)
+        let edge_dist = nx.abs().max(ny.abs());  // Square distance to edge
+        let edge_falloff = if edge_dist > 0.85 {
+            let t = (edge_dist - 0.85) / 0.15;
+            1.0 - t.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        // ===== LAND THRESHOLD =====
+        // Higher island_factor = lower threshold = more land
+        // Base threshold around 0, adjusted by island_factor
+        let threshold = 0.1 - (self.config.island_factor - 0.5) * 0.8;
+        
+        // Noise above threshold = land
+        let land_value = if noise_value > threshold {
+            let excess = (noise_value - threshold) / (1.0 - threshold);
+            (excess * 2.0).clamp(0.0, 1.0) * edge_falloff
+        } else {
+            0.0
+        };
+
+        land_value
+    }
+}
+
 /// Create a shape function based on configuration.
 pub fn create_shape_function(config: &IslandConfig) -> Box<dyn ShapeFunction> {
     match config.shape {
@@ -252,6 +362,7 @@ pub fn create_shape_function(config: &IslandConfig) -> Box<dyn ShapeFunction> {
         IslandShape::Square => Box::new(SquareIsland::new(config)),
         IslandShape::Noise => Box::new(NoiseIsland::new(config)),
         IslandShape::Blob => Box::new(BlobIsland::new(config)),
+        IslandShape::DomainWarp => Box::new(DomainWarpIsland::new(config)),
     }
 }
 
@@ -391,6 +502,127 @@ pub fn generate_island(
     assign_corner_water(mesh, shape.as_ref(), bounds, water_threshold);
     assign_center_water(mesh);
     assign_ocean(mesh);
+    
+    // Note: Small island removal is now done in generate_map_with_config
+    // to allow configuration of min_size and min_fraction
+}
+
+/// Configuration for domain warp island shape.
+#[derive(Debug, Clone)]
+pub struct DomainWarpConfig {
+    /// Warp strength (how much coordinates are distorted).
+    pub warp_strength: f64,
+    /// Number of warp iterations for more complex distortion.
+    pub warp_iterations: u32,
+    /// Shape noise octaves.
+    pub shape_octaves: u32,
+}
+
+impl Default for DomainWarpConfig {
+    fn default() -> Self {
+        Self {
+            warp_strength: 200.0,
+            warp_iterations: 2,
+            shape_octaves: 5,
+        }
+    }
+}
+
+/// Remove small isolated landmasses to reduce fragmentation.
+/// `min_size` is the minimum number of connected land cells to keep.
+/// `min_fraction` is the minimum size as a fraction of the largest island.
+pub fn remove_small_islands(mesh: &mut DualMesh, min_size: usize, min_fraction: f64) {
+    use std::collections::HashSet;
+    
+    // Find all connected land components
+    let mut visited = HashSet::new();
+    let mut components: Vec<Vec<usize>> = Vec::new();
+    
+    for start in 0..mesh.num_solid_centers {
+        if visited.contains(&start) || mesh.centers[start].water {
+            continue;
+        }
+        
+        // BFS to find connected land component
+        let mut component = Vec::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(start);
+        visited.insert(start);
+        
+        while let Some(idx) = queue.pop_front() {
+            component.push(idx);
+            
+            for &neighbor in &mesh.centers[idx].neighbors {
+                if neighbor >= mesh.num_solid_centers || visited.contains(&neighbor) {
+                    continue;
+                }
+                if !mesh.centers[neighbor].water {
+                    visited.insert(neighbor);
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        
+        components.push(component);
+    }
+    
+    // Find the largest component
+    let largest_size = components.iter().map(|c| c.len()).max().unwrap_or(0);
+    let fraction_threshold = (largest_size as f64 * min_fraction) as usize;
+    
+    // Convert small components to ocean
+    for component in &components {
+        // Keep components that are at least min_size or at least min_fraction of largest
+        let threshold = min_size.max(fraction_threshold);
+        if component.len() < threshold {
+            for &idx in component {
+                mesh.centers[idx].water = true;
+                mesh.centers[idx].ocean = true;
+                
+                // Also update corners
+                for &corner_idx in &mesh.centers[idx].corners {
+                    if corner_idx < mesh.corners.len() {
+                        mesh.corners[corner_idx].water = true;
+                        mesh.corners[corner_idx].ocean = true;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Re-assign coast status after removing islands
+    assign_coast_status(mesh);
+}
+
+/// Re-assign coast status after modifications.
+fn assign_coast_status(mesh: &mut DualMesh) {
+    // Reset coast status
+    for center in mesh.centers.iter_mut() {
+        center.coast = false;
+    }
+    for corner in mesh.corners.iter_mut() {
+        corner.coast = false;
+    }
+    
+    // Mark coast centers (land adjacent to ocean)
+    for i in 0..mesh.num_solid_centers {
+        if mesh.centers[i].water {
+            continue;
+        }
+        let has_ocean_neighbor = mesh.centers[i].neighbors.iter()
+            .any(|&n| n < mesh.centers.len() && mesh.centers[n].ocean);
+        mesh.centers[i].coast = has_ocean_neighbor;
+    }
+    
+    // Mark coast corners
+    for i in 0..mesh.num_solid_corners {
+        let touches: Vec<usize> = mesh.corners[i].touches.clone();
+        let touch_land = touches.iter()
+            .any(|&c| c < mesh.centers.len() && !mesh.centers[c].water);
+        let touch_ocean = touches.iter()
+            .any(|&c| c < mesh.centers.len() && mesh.centers[c].ocean);
+        mesh.corners[i].coast = touch_land && touch_ocean;
+    }
 }
 
 #[cfg(test)]
